@@ -12,6 +12,7 @@ from database import SessionLocal
 from models import Vendor, Transaction
 from parser import parse_transaction
 from summaries import daily_summary, weekly_summary
+from tts import synthesize_speech
 
 load_dotenv()
 
@@ -56,12 +57,22 @@ def get_or_create_vendor(db, chat_id: str) -> Vendor:
 
 def format_summary(summary: dict, title: str) -> str:
     return (
-        f"📊 {title}\n\n"
-        f"💰 ሽያጭ (Sales): {summary['total_sales']} ብር\n"
-        f"💸 ወጪ (Expenses): {summary['total_expenses']} ብር\n"
-        f"🤝 ዱቤ (Debt): {summary['total_debt']} ብር\n"
-        f"📈 ተጣራ ትርፍ (Net Profit): {summary['net_profit']} ብር"
+        f"{title}. "
+        f"ሽያጭ {summary['total_sales']} ብር. "
+        f"ወጪ {summary['total_expenses']} ብር. "
+        f"ዱቤ {summary['total_debt']} ብር. "
+        f"ተጣራ ትርፍ {summary['net_profit']} ብር።"
     )
+
+
+async def reply_with_voice(update: Update, text: str):
+    """Speak the given Amharic text back to the vendor as a Telegram voice message."""
+    audio_path = synthesize_speech(text)
+    if audio_path:
+        with open(audio_path, "rb") as audio_file:
+            await update.message.reply_voice(voice=audio_file)
+    else:
+        await update.message.reply_text(text)  # fallback if TTS fails
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -75,7 +86,7 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         vendor = get_or_create_vendor(db, chat_id)
         summary = daily_summary(db, vendor.id)
-        await update.message.reply_text(format_summary(summary, "የዛሬ ማጠቃለያ (Today's Summary)"))
+        await reply_with_voice(update, format_summary(summary, "የዛሬ ማጠቃለያ"))
     finally:
         db.close()
 
@@ -86,7 +97,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         vendor = get_or_create_vendor(db, chat_id)
         summary = weekly_summary(db, vendor.id)
-        await update.message.reply_text(format_summary(summary, "የሳምንት ማጠቃለያ (Weekly Summary)"))
+        await reply_with_voice(update, format_summary(summary, "የሳምንት ማጠቃለያ"))
     finally:
         db.close()
 
@@ -106,20 +117,22 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     transcribed_text = transcribe_wav(wav_path)
 
     if transcribed_text is None:
-        await update.message.reply_text("ይቅርታ፣ ስህተት ተፈጥሯል። እባክዎ ደግመው ይሞክሩ።")
+        await reply_with_voice(update, "ይቅርታ፣ ስህተት ተፈጥሯል። እባክዎ ደግመው ይሞክሩ።")
         return
     elif transcribed_text == "":
-        await update.message.reply_text("አልተሰማም፣ እባክዎ ደግመው ይናገሩ።")
+        await reply_with_voice(update, "አልተሰማም፣ እባክዎ ደግመው ይናገሩ።")
         return
+
+    await update.message.reply_text(f"📝 {transcribed_text}")  # keep text of what was heard, for transparency
 
     result = parse_transaction(transcribed_text)
 
     if result.get("status") == "needs_clarification":
-        await update.message.reply_text(f"📝 {transcribed_text}\n\n❓ {result.get('question')}")
+        await reply_with_voice(update, result.get("question"))
         return
 
     if result.get("status") != "ok":
-        await update.message.reply_text(f"📝 {transcribed_text}\n\n⚠️ Could not process, please try again.")
+        await reply_with_voice(update, "ይቅርታ፣ መረዳት አልቻልኩም። እባክዎ ደግመው ይሞክሩ።")
         return
 
     db = SessionLocal()
@@ -136,9 +149,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.add(transaction)
         db.commit()
         db.refresh(transaction)
-        await update.message.reply_text(
-            f"📝 {transcribed_text}\n\n✅ ተመዝግቧል: {result.get('type')} — {result.get('item') or ''} {result.get('amount')} ብር"
-        )
+
+        confirmation_text = f"{result.get('item') or ''} {result.get('amount')} ብር ተመዝግቧል።"
+        await reply_with_voice(update, confirmation_text)
     finally:
         db.close()
 
