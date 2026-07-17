@@ -1,10 +1,16 @@
 import os
 import subprocess
+import sys
 import azure.cognitiveservices.speech as speechsdk
 from fastapi import FastAPI, Request
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
+
+sys.path.insert(0, os.path.dirname(__file__))
+from database import SessionLocal
+from models import Vendor, Transaction
+from parser import parse_transaction
 
 load_dotenv()
 
@@ -17,23 +23,16 @@ telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 
 def convert_ogg_to_wav(ogg_path: str, wav_path: str):
-    """Convert a .ogg voice file to .wav (16kHz, mono) using ffmpeg."""
     subprocess.run([
-        "ffmpeg", "-y",
-        "-i", ogg_path,
-        "-ar", "16000",
-        "-ac", "1",
-        wav_path
+        "ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path
     ], check=True, capture_output=True)
 
 
 def transcribe_wav(wav_path: str) -> str:
-    """Send a .wav file to Azure Speech-to-Text (Amharic) and return the transcribed text."""
     speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
     speech_config.speech_recognition_language = "am-ET"
     audio_config = speechsdk.audio.AudioConfig(filename=wav_path)
     recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-
     result = recognizer.recognize_once()
 
     if result.reason == speechsdk.ResultReason.RecognizedSpeech:
@@ -41,7 +40,17 @@ def transcribe_wav(wav_path: str) -> str:
     elif result.reason == speechsdk.ResultReason.NoMatch:
         return ""
     else:
-        return None  # signals an error
+        return None
+
+
+def get_or_create_vendor(db, chat_id: str) -> Vendor:
+    vendor = db.query(Vendor).filter(Vendor.telegram_chat_id == chat_id).first()
+    if vendor is None:
+        vendor = Vendor(telegram_chat_id=chat_id)
+        db.add(vendor)
+        db.commit()
+        db.refresh(vendor)
+    return vendor
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50,6 +59,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
     voice = update.message.voice
     file = await context.bot.get_file(voice.file_id)
 
@@ -63,13 +73,41 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     transcribed_text = transcribe_wav(wav_path)
 
     if transcribed_text is None:
-        await update.message.reply_text("ይቅርታ፣ ስህተት ተፈጥሯል። እባክዎ ደግመው ይሞክሩ። (Error, please try again)")
+        await update.message.reply_text("ይቅርታ፣ ስህተት ተፈጥሯል። እባክዎ ደግመው ይሞክሩ።")
+        return
     elif transcribed_text == "":
-        await update.message.reply_text("አልተሰማም፣ እባክዎ ደግመው ይናገሩ። (Didn't catch that, please repeat)")
-    else:
-        await update.message.reply_text(f"📝 {transcribed_text}")
+        await update.message.reply_text("አልተሰማም፣ እባክዎ ደግመው ይናገሩ።")
+        return
 
-    print(f"Voice: {ogg_path} -> Transcription: {transcribed_text}")
+    result = parse_transaction(transcribed_text)
+
+    if result.get("status") == "needs_clarification":
+        await update.message.reply_text(f"📝 {transcribed_text}\n\n❓ {result.get('question')}")
+        return
+
+    if result.get("status") != "ok":
+        await update.message.reply_text(f"📝 {transcribed_text}\n\n⚠️ Could not process, please try again.")
+        return
+
+    db = SessionLocal()
+    try:
+        vendor = get_or_create_vendor(db, chat_id)
+        transaction = Transaction(
+            vendor_id=vendor.id,
+            type=result.get("type"),
+            item=result.get("item"),
+            amount=result.get("amount"),
+            customer_name=result.get("customer_name"),
+            note=result.get("note"),
+        )
+        db.add(transaction)
+        db.commit()
+        db.refresh(transaction)
+        await update.message.reply_text(
+            f"📝 {transcribed_text}\n\n✅ ተመዝግቧል: {result.get('type')} — {result.get('item') or ''} {result.get('amount')} ብር"
+        )
+    finally:
+        db.close()
 
 
 telegram_app.add_handler(CommandHandler("start", start))
