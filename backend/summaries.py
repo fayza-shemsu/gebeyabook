@@ -44,3 +44,17 @@ def _summarize_range(db, vendor_id: int, start: datetime, end: datetime) -> dict
         "total_debt": totals["debt"],
         "net_profit": net_profit,
     }
+
+
+def debts_summary(db, vendor_id: int) -> list:
+    """Return a list of {customer_name, total_owed} for everyone who currently owes this vendor money."""
+    from models import Transaction as Tx
+    rows = (
+        db.query(Tx.customer_name, func.sum(Tx.amount))
+        .filter(Tx.vendor_id == vendor_id)
+        .filter(Tx.type == "debt")
+        .filter(Tx.customer_name.isnot(None))
+        .group_by(Tx.customer_name)
+        .all()
+    )
+    return [{"customer_name": name, "total_owed": total} for name, total in rows]

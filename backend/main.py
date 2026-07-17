@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from database import SessionLocal
 from models import Vendor, Transaction
 from parser import parse_transaction
-from summaries import daily_summary, weekly_summary
+from summaries import daily_summary, weekly_summary, debts_summary
 from tts import synthesize_speech
 
 load_dotenv()
@@ -54,7 +54,6 @@ def transcribe_wav(wav_path: str) -> str:
 
 
 async def transcribe_incoming_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Helper: download + convert + transcribe. Returns text, '' (no speech), or None (real failure after retries)."""
     voice = update.message.voice
     file = await context.bot.get_file(voice.file_id)
     os.makedirs("data/incoming_voice", exist_ok=True)
@@ -88,6 +87,15 @@ def format_summary(summary: dict, title: str) -> str:
     )
 
 
+def format_debts(debts: list) -> str:
+    if not debts:
+        return "ምንም ያልተከፈለ ዱቤ የለም።"
+    parts = ["ያልተከፈለ ዱቤ:"]
+    for d in debts:
+        parts.append(f"{d['customer_name']} {d['total_owed']} ብር")
+    return ". ".join(parts) + "።"
+
+
 async def reply_with_voice(update: Update, text: str):
     try:
         audio_path = synthesize_speech(text)
@@ -101,11 +109,10 @@ async def reply_with_voice(update: Update, text: str):
             return
         except TelegramError:
             pass
-    # fallback if TTS or sending voice failed
     try:
         await update.message.reply_text(text)
     except TelegramError:
-        pass  # nothing more we can do — don't crash the handler
+        pass
 
 
 # ---------- Onboarding conversation ----------
@@ -199,6 +206,17 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
+async def debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    db = SessionLocal()
+    try:
+        vendor = get_or_create_vendor(db, chat_id)
+        debt_list = debts_summary(db, vendor.id)
+        await reply_with_voice(update, format_debts(debt_list))
+    finally:
+        db.close()
+
+
 # ---------- Save a completed parsed transaction ----------
 
 async def save_transaction(update: Update, chat_id: str, transcribed_text: str, result: dict):
@@ -215,7 +233,10 @@ async def save_transaction(update: Update, chat_id: str, transcribed_text: str, 
         )
         db.add(transaction)
         db.commit()
-        confirmation_text = f"{result.get('item') or ''} {result.get('amount')} ብር ተመዝግቧል።"
+        if result.get("type") == "debt":
+            confirmation_text = f"ዱቤ ለ{result.get('customer_name') or ''} {result.get('amount')} ብር ተመዝግቧል።"
+        else:
+            confirmation_text = f"{result.get('item') or ''} {result.get('amount')} ብር ተመዝግቧል።"
         await reply_with_voice(update, confirmation_text)
     finally:
         db.close()
@@ -237,7 +258,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📝 {transcribed_text}")
 
-    # If we're waiting on a follow-up answer to a clarification question, combine it with the original text
     pending = context.user_data.get("pending_clarification")
     if pending:
         combined_text = f"{pending['original_text']} {transcribed_text}"
@@ -248,7 +268,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = parse_transaction(combined_text)
 
     if result.get("status") == "needs_clarification":
-        # remember what we asked, and the text so far, so the next message can complete it
         context.user_data["pending_clarification"] = {"original_text": combined_text}
         await reply_with_voice(update, result.get("question") or "ስንት ብር ነው?")
         return
@@ -274,6 +293,7 @@ onboarding_conv = ConversationHandler(
 telegram_app.add_handler(onboarding_conv)
 telegram_app.add_handler(CommandHandler("today", today))
 telegram_app.add_handler(CommandHandler("week", week))
+telegram_app.add_handler(CommandHandler("debts", debts))
 telegram_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
 
