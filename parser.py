@@ -2,6 +2,7 @@ import os
 import json
 from dotenv import load_dotenv
 from groq import Groq
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
 
@@ -49,16 +50,31 @@ OR, if item or amount is missing/unclear:
 Only output valid JSON. Nothing else."""
 
 
-def parse_transaction(text: str) -> dict:
-    response = client.chat.completions.create(
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=6),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
+def _call_groq(text: str):
+    return client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": text}
         ],
         temperature=0.1,
-        response_format={"type": "json_object"}
+        response_format={"type": "json_object"},
+        timeout=15,
     )
+
+
+def parse_transaction(text: str) -> dict:
+    try:
+        response = _call_groq(text)
+    except Exception as e:
+        return {"status": "error", "raw_output": str(e)}
+
     raw = response.choices[0].message.content
     try:
         return json.loads(raw)

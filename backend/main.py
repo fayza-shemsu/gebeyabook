@@ -4,11 +4,13 @@ import sys
 import azure.cognitiveservices.speech as speechsdk
 from fastapi import FastAPI, Request
 from telegram import Update, Bot
+from telegram.error import TelegramError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
     filters, ContextTypes
 )
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 sys.path.insert(0, os.path.dirname(__file__))
 from database import SessionLocal
@@ -26,16 +28,16 @@ AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
 app = FastAPI()
 telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-# Conversation states for onboarding
 ASK_NAME, ASK_SELLS = range(2)
 
 
 def convert_ogg_to_wav(ogg_path: str, wav_path: str):
     subprocess.run([
         "ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path
-    ], check=True, capture_output=True)
+    ], check=True, capture_output=True, timeout=20)
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=6))
 def transcribe_wav(wav_path: str) -> str:
     speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
     speech_config.speech_recognition_language = "am-ET"
@@ -48,11 +50,11 @@ def transcribe_wav(wav_path: str) -> str:
     elif result.reason == speechsdk.ResultReason.NoMatch:
         return ""
     else:
-        return None
+        raise RuntimeError(f"STT failed: {result.reason}")
 
 
-async def transcribe_incoming_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Helper: download + convert + transcribe a voice message the user just sent. Returns text or None/''."""
+async def transcribe_incoming_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Helper: download + convert + transcribe. Returns text, '' (no speech), or None (real failure after retries)."""
     voice = update.message.voice
     file = await context.bot.get_file(voice.file_id)
     os.makedirs("data/incoming_voice", exist_ok=True)
@@ -60,7 +62,10 @@ async def transcribe_incoming_voice(update: Update, context: ContextTypes.DEFAUL
     wav_path = f"data/incoming_voice/{voice.file_id}.wav"
     await file.download_to_drive(ogg_path)
     convert_ogg_to_wav(ogg_path, wav_path)
-    return transcribe_wav(wav_path)
+    try:
+        return transcribe_wav(wav_path)
+    except Exception:
+        return None
 
 
 def get_or_create_vendor(db, chat_id: str) -> Vendor:
@@ -84,12 +89,23 @@ def format_summary(summary: dict, title: str) -> str:
 
 
 async def reply_with_voice(update: Update, text: str):
-    audio_path = synthesize_speech(text)
+    try:
+        audio_path = synthesize_speech(text)
+    except Exception:
+        audio_path = None
+
     if audio_path:
-        with open(audio_path, "rb") as audio_file:
-            await update.message.reply_voice(voice=audio_file)
-    else:
+        try:
+            with open(audio_path, "rb") as audio_file:
+                await update.message.reply_voice(voice=audio_file)
+            return
+        except TelegramError:
+            pass
+    # fallback if TTS or sending voice failed
+    try:
         await update.message.reply_text(text)
+    except TelegramError:
+        pass  # nothing more we can do — don't crash the handler
 
 
 # ---------- Onboarding conversation ----------
@@ -100,7 +116,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         vendor = db.query(Vendor).filter(Vendor.telegram_chat_id == chat_id).first()
         if vendor and vendor.name and vendor.sells:
-            # Already onboarded — just greet
             await update.message.reply_text(
                 f"እንኳን ደህና መጡ፣ {vendor.name}! ሽያጭዎን በድምጽ ብቻ ይናገሩ።"
             )
@@ -151,9 +166,7 @@ async def ask_sells_response(update: Update, context: ContextTypes.DEFAULT_TYPE)
     finally:
         db.close()
 
-    await update.message.reply_text(
-        f"ተመዝግበዋል {name}! ከአሁን ጀምሮ ሽያጭዎን በድምጽ ብቻ ይናገሩ።"
-    )
+    await update.message.reply_text(f"ተመዝግበዋል {name}! ከአሁን ጀምሮ ሽያጭዎን በድምጽ ብቻ ይናገሩ።")
     return ConversationHandler.END
 
 
@@ -186,32 +199,9 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
-# ---------- Main voice transaction handler ----------
+# ---------- Save a completed parsed transaction ----------
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-
-    transcribed_text = await transcribe_incoming_voice(update, context)
-
-    if transcribed_text is None:
-        await reply_with_voice(update, "ይቅርታ፣ ስህተት ተፈጥሯል። እባክዎ ደግመው ይሞክሩ።")
-        return
-    elif transcribed_text == "":
-        await reply_with_voice(update, "አልተሰማም፣ እባክዎ ደግመው ይናገሩ።")
-        return
-
-    await update.message.reply_text(f"📝 {transcribed_text}")
-
-    result = parse_transaction(transcribed_text)
-
-    if result.get("status") == "needs_clarification":
-        await reply_with_voice(update, result.get("question"))
-        return
-
-    if result.get("status") != "ok":
-        await reply_with_voice(update, "ይቅርታ፣ መረዳት አልቻልኩም። እባክዎ ደግመው ይሞክሩ።")
-        return
-
+async def save_transaction(update: Update, chat_id: str, transcribed_text: str, result: dict):
     db = SessionLocal()
     try:
         vendor = get_or_create_vendor(db, chat_id)
@@ -225,12 +215,49 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         db.add(transaction)
         db.commit()
-        db.refresh(transaction)
-
         confirmation_text = f"{result.get('item') or ''} {result.get('amount')} ብር ተመዝግቧል።"
         await reply_with_voice(update, confirmation_text)
     finally:
         db.close()
+
+
+# ---------- Main voice transaction handler ----------
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+
+    transcribed_text = await transcribe_incoming_voice(update, context)
+
+    if transcribed_text is None:
+        await reply_with_voice(update, "ይቅርታ፣ የግንኙነት ችግር ተፈጥሯል። እባክዎ ደግመው ይላኩ።")
+        return
+    elif transcribed_text == "":
+        await reply_with_voice(update, "አልተሰማም፣ እባክዎ ደግመው ይናገሩ።")
+        return
+
+    await update.message.reply_text(f"📝 {transcribed_text}")
+
+    # If we're waiting on a follow-up answer to a clarification question, combine it with the original text
+    pending = context.user_data.get("pending_clarification")
+    if pending:
+        combined_text = f"{pending['original_text']} {transcribed_text}"
+        context.user_data.pop("pending_clarification", None)
+    else:
+        combined_text = transcribed_text
+
+    result = parse_transaction(combined_text)
+
+    if result.get("status") == "needs_clarification":
+        # remember what we asked, and the text so far, so the next message can complete it
+        context.user_data["pending_clarification"] = {"original_text": combined_text}
+        await reply_with_voice(update, result.get("question") or "ስንት ብር ነው?")
+        return
+
+    if result.get("status") != "ok":
+        await reply_with_voice(update, "ይቅርታ፣ መረዳት አልቻልኩም። እባክዎ ደግመው ይሞክሩ።")
+        return
+
+    await save_transaction(update, chat_id, combined_text, result)
 
 
 # ---------- Handlers setup ----------
@@ -252,9 +279,12 @@ telegram_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
+    try:
+        data = await request.json()
+        update = Update.de_json(data, telegram_app.bot)
+        await telegram_app.process_update(update)
+    except Exception as e:
+        print(f"Webhook error (swallowed to avoid crash): {e}")
     return {"ok": True}
 
 
