@@ -9,6 +9,7 @@ class Vendor(Base):
     id = Column(Integer, primary_key=True, index=True)
     telegram_chat_id = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, nullable=True)
+    sells = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -17,7 +18,7 @@ class Transaction(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     vendor_id = Column(Integer, ForeignKey("vendors.id"), nullable=False)
-    type = Column(String, nullable=False)          # sale / expense / debt
+    type = Column(String, nullable=False)
     item = Column(String, nullable=True)
     amount = Column(Float, nullable=False)
     customer_name = Column(String, nullable=True)

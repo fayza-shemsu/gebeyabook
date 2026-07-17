@@ -4,7 +4,10 @@ import sys
 import azure.cognitiveservices.speech as speechsdk
 from fastapi import FastAPI, Request
 from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ConversationHandler,
+    filters, ContextTypes
+)
 from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -22,6 +25,9 @@ AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
 
 app = FastAPI()
 telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+# Conversation states for onboarding
+ASK_NAME, ASK_SELLS = range(2)
 
 
 def convert_ogg_to_wav(ogg_path: str, wav_path: str):
@@ -45,6 +51,18 @@ def transcribe_wav(wav_path: str) -> str:
         return None
 
 
+async def transcribe_incoming_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Helper: download + convert + transcribe a voice message the user just sent. Returns text or None/''."""
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+    os.makedirs("data/incoming_voice", exist_ok=True)
+    ogg_path = f"data/incoming_voice/{voice.file_id}.ogg"
+    wav_path = f"data/incoming_voice/{voice.file_id}.wav"
+    await file.download_to_drive(ogg_path)
+    convert_ogg_to_wav(ogg_path, wav_path)
+    return transcribe_wav(wav_path)
+
+
 def get_or_create_vendor(db, chat_id: str) -> Vendor:
     vendor = db.query(Vendor).filter(Vendor.telegram_chat_id == chat_id).first()
     if vendor is None:
@@ -66,19 +84,85 @@ def format_summary(summary: dict, title: str) -> str:
 
 
 async def reply_with_voice(update: Update, text: str):
-    """Speak the given Amharic text back to the vendor as a Telegram voice message."""
     audio_path = synthesize_speech(text)
     if audio_path:
         with open(audio_path, "rb") as audio_file:
             await update.message.reply_voice(voice=audio_file)
     else:
-        await update.message.reply_text(text)  # fallback if TTS fails
+        await update.message.reply_text(text)
 
+
+# ---------- Onboarding conversation ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_message = "እንኳን ደህና መጡ! ወደ ገበያ ደብተር በድምጽ የሽያጭ መዝገብ ቦት። ሽያጭዎን በድምጽ ብቻ ይናገሩ።"
-    await update.message.reply_text(welcome_message)
+    chat_id = str(update.effective_chat.id)
+    db = SessionLocal()
+    try:
+        vendor = db.query(Vendor).filter(Vendor.telegram_chat_id == chat_id).first()
+        if vendor and vendor.name and vendor.sells:
+            # Already onboarded — just greet
+            await update.message.reply_text(
+                f"እንኳን ደህና መጡ፣ {vendor.name}! ሽያጭዎን በድምጽ ብቻ ይናገሩ።"
+            )
+            return ConversationHandler.END
+    finally:
+        db.close()
 
+    await update.message.reply_text(
+        "እንኳን ደህና መጡ! ወደ ገበያ ደብተር በድምጽ የሽያጭ መዝገብ ቦት። እባክዎ ስምዎን ይንገሩኝ (በጽሁፍ ወይም በድምጽ)።"
+    )
+    return ASK_NAME
+
+
+async def ask_name_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.voice:
+        name = await transcribe_incoming_voice(update, context)
+    else:
+        name = update.message.text
+
+    if not name:
+        await update.message.reply_text("አልተሰማም፣ እባክዎ ስምዎን ደግመው ይንገሩኝ።")
+        return ASK_NAME
+
+    context.user_data["pending_name"] = name.strip()
+    await update.message.reply_text(f"አመሰግናለሁ {name}! ምን ዓይነት እቃ ነው የሚሸጡት?")
+    return ASK_SELLS
+
+
+async def ask_sells_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.voice:
+        sells = await transcribe_incoming_voice(update, context)
+    else:
+        sells = update.message.text
+
+    if not sells:
+        await update.message.reply_text("አልተሰማም፣ እባክዎ ደግመው ይንገሩኝ።")
+        return ASK_SELLS
+
+    chat_id = str(update.effective_chat.id)
+    name = context.user_data.get("pending_name")
+
+    db = SessionLocal()
+    try:
+        vendor = get_or_create_vendor(db, chat_id)
+        vendor.name = name
+        vendor.sells = sells.strip()
+        db.commit()
+    finally:
+        db.close()
+
+    await update.message.reply_text(
+        f"ተመዝግበዋል {name}! ከአሁን ጀምሮ ሽያጭዎን በድምጽ ብቻ ይናገሩ።"
+    )
+    return ConversationHandler.END
+
+
+async def cancel_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("ተሰርዟል። /start ብለው እንደገና ይጀምሩ።")
+    return ConversationHandler.END
+
+
+# ---------- Summaries ----------
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -102,19 +186,12 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
+# ---------- Main voice transaction handler ----------
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    voice = update.message.voice
-    file = await context.bot.get_file(voice.file_id)
 
-    os.makedirs("data/incoming_voice", exist_ok=True)
-    ogg_path = f"data/incoming_voice/{voice.file_id}.ogg"
-    wav_path = f"data/incoming_voice/{voice.file_id}.wav"
-
-    await file.download_to_drive(ogg_path)
-    convert_ogg_to_wav(ogg_path, wav_path)
-
-    transcribed_text = transcribe_wav(wav_path)
+    transcribed_text = await transcribe_incoming_voice(update, context)
 
     if transcribed_text is None:
         await reply_with_voice(update, "ይቅርታ፣ ስህተት ተፈጥሯል። እባክዎ ደግመው ይሞክሩ።")
@@ -123,7 +200,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_with_voice(update, "አልተሰማም፣ እባክዎ ደግመው ይናገሩ።")
         return
 
-    await update.message.reply_text(f"📝 {transcribed_text}")  # keep text of what was heard, for transparency
+    await update.message.reply_text(f"📝 {transcribed_text}")
 
     result = parse_transaction(transcribed_text)
 
@@ -156,7 +233,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
-telegram_app.add_handler(CommandHandler("start", start))
+# ---------- Handlers setup ----------
+
+onboarding_conv = ConversationHandler(
+    entry_points=[CommandHandler("start", start)],
+    states={
+        ASK_NAME: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, ask_name_response)],
+        ASK_SELLS: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, ask_sells_response)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel_onboarding)],
+)
+
+telegram_app.add_handler(onboarding_conv)
 telegram_app.add_handler(CommandHandler("today", today))
 telegram_app.add_handler(CommandHandler("week", week))
 telegram_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
