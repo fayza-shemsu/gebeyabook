@@ -58,3 +58,13 @@ def debts_summary(db, vendor_id: int) -> list:
         .all()
     )
     return [{"customer_name": name, "total_owed": total} for name, total in rows]
+
+
+def get_last_transaction(db, vendor_id: int):
+    from models import Transaction as Tx
+    return (
+        db.query(Tx)
+        .filter(Tx.vendor_id == vendor_id)
+        .order_by(Tx.id.desc())
+        .first()
+    )

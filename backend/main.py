@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from database import SessionLocal
 from models import Vendor, Transaction
 from parser import parse_transaction
-from summaries import daily_summary, weekly_summary, debts_summary
+from summaries import daily_summary, weekly_summary, debts_summary, get_last_transaction
 from tts import synthesize_speech
 
 load_dotenv()
@@ -29,6 +29,9 @@ app = FastAPI()
 telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 ASK_NAME, ASK_SELLS = range(2)
+EDIT_FIELD, EDIT_VALUE = range(2, 4)
+
+MISTAKE_KEYWORDS = ["ስሕተት", "ስህተት"]  # both common spellings
 
 
 def convert_ogg_to_wav(ogg_path: str, wav_path: str):
@@ -113,6 +116,25 @@ async def reply_with_voice(update: Update, text: str):
         await update.message.reply_text(text)
     except TelegramError:
         pass
+
+
+# ---------- Undo helper (shared by voice trigger and /undo command) ----------
+
+async def perform_undo(update: Update, chat_id: str):
+    db = SessionLocal()
+    try:
+        vendor = get_or_create_vendor(db, chat_id)
+        last_tx = get_last_transaction(db, vendor.id)
+        if last_tx is None:
+            await reply_with_voice(update, "የሚሰረዝ ምንም ግብይት የለም።")
+            return
+        item_desc = last_tx.item or (last_tx.customer_name or "")
+        amount = last_tx.amount
+        db.delete(last_tx)
+        db.commit()
+        await reply_with_voice(update, f"{item_desc} {amount} ብር ተሰርዟል።")
+    finally:
+        db.close()
 
 
 # ---------- Onboarding conversation ----------
@@ -217,6 +239,100 @@ async def debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
+async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    await perform_undo(update, chat_id)
+
+
+# ---------- /edit_last conversation ----------
+
+async def edit_last_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    db = SessionLocal()
+    try:
+        vendor = get_or_create_vendor(db, chat_id)
+        last_tx = get_last_transaction(db, vendor.id)
+        if last_tx is None:
+            await update.message.reply_text("የሚስተካከል ምንም ግብይት የለም።")
+            return ConversationHandler.END
+        context.user_data["editing_tx_id"] = last_tx.id
+        await update.message.reply_text(
+            f"የመጨረሻው ግብይት: {last_tx.item or last_tx.customer_name or ''} {last_tx.amount} ብር።\n"
+            f"ምን ማስተካከል ይፈልጋሉ? 'ዋጋ' ወይም 'እቃ' ይበሉ።"
+        )
+        return EDIT_FIELD
+    finally:
+        db.close()
+
+
+async def edit_field_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.voice:
+        field_text = await transcribe_incoming_voice(update, context)
+    else:
+        field_text = update.message.text
+
+    if not field_text:
+        await update.message.reply_text("አልተሰማም፣ 'ዋጋ' ወይም 'እቃ' ይበሉ።")
+        return EDIT_FIELD
+
+    field_text = field_text.strip()
+    if "ዋጋ" in field_text or "ብር" in field_text:
+        context.user_data["editing_field"] = "amount"
+        await update.message.reply_text("አዲሱ ዋጋ ስንት ብር ነው?")
+    elif "እቃ" in field_text:
+        context.user_data["editing_field"] = "item"
+        await update.message.reply_text("አዲሱ የእቃ ስም ማን ነው?")
+    else:
+        await update.message.reply_text("አልገባኝም፣ 'ዋጋ' ወይም 'እቃ' ይበሉ።")
+        return EDIT_FIELD
+
+    return EDIT_VALUE
+
+
+async def edit_value_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.voice:
+        new_value = await transcribe_incoming_voice(update, context)
+    else:
+        new_value = update.message.text
+
+    if not new_value:
+        await update.message.reply_text("አልተሰማም፣ እባክዎ ደግመው ይናገሩ።")
+        return EDIT_VALUE
+
+    tx_id = context.user_data.get("editing_tx_id")
+    field = context.user_data.get("editing_field")
+
+    db = SessionLocal()
+    try:
+        tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+        if tx is None:
+            await update.message.reply_text("ስህተት፣ ግብይቱ አልተገኘም።")
+            return ConversationHandler.END
+
+        if field == "amount":
+            digits = "".join(c for c in new_value if c.isdigit())
+            if not digits:
+                await update.message.reply_text("ቁጥር አልገባኝም፣ እባክዎ ቁጥር ብቻ ይናገሩ።")
+                return EDIT_VALUE
+            tx.amount = float(digits)
+        elif field == "item":
+            tx.item = new_value.strip()
+
+        db.commit()
+        await reply_with_voice(update, f"ተስተካክሏል: {tx.item or ''} {tx.amount} ብር።")
+    finally:
+        db.close()
+
+    context.user_data.pop("editing_tx_id", None)
+    context.user_data.pop("editing_field", None)
+    return ConversationHandler.END
+
+
+async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("ተሰርዟል።")
+    return ConversationHandler.END
+
+
 # ---------- Save a completed parsed transaction ----------
 
 async def save_transaction(update: Update, chat_id: str, transcribed_text: str, result: dict):
@@ -258,6 +374,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📝 {transcribed_text}")
 
+    # Voice-triggered undo: if the vendor says a mistake keyword, undo instead of parsing as a transaction
+    if any(kw in transcribed_text for kw in MISTAKE_KEYWORDS):
+        await perform_undo(update, chat_id)
+        return
+
     pending = context.user_data.get("pending_clarification")
     if pending:
         combined_text = f"{pending['original_text']} {transcribed_text}"
@@ -290,10 +411,21 @@ onboarding_conv = ConversationHandler(
     fallbacks=[CommandHandler("cancel", cancel_onboarding)],
 )
 
+edit_last_conv = ConversationHandler(
+    entry_points=[CommandHandler("edit_last", edit_last_start)],
+    states={
+        EDIT_FIELD: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, edit_field_response)],
+        EDIT_VALUE: [MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, edit_value_response)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel_edit)],
+)
+
 telegram_app.add_handler(onboarding_conv)
+telegram_app.add_handler(edit_last_conv)
 telegram_app.add_handler(CommandHandler("today", today))
 telegram_app.add_handler(CommandHandler("week", week))
 telegram_app.add_handler(CommandHandler("debts", debts))
+telegram_app.add_handler(CommandHandler("undo", undo_command))
 telegram_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
 
