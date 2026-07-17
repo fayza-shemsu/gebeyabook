@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from database import SessionLocal
 from models import Vendor, Transaction
 from parser import parse_transaction
+from summaries import daily_summary, weekly_summary
 
 load_dotenv()
 
@@ -53,9 +54,41 @@ def get_or_create_vendor(db, chat_id: str) -> Vendor:
     return vendor
 
 
+def format_summary(summary: dict, title: str) -> str:
+    return (
+        f"📊 {title}\n\n"
+        f"💰 ሽያጭ (Sales): {summary['total_sales']} ብር\n"
+        f"💸 ወጪ (Expenses): {summary['total_expenses']} ብር\n"
+        f"🤝 ዱቤ (Debt): {summary['total_debt']} ብር\n"
+        f"📈 ተጣራ ትርፍ (Net Profit): {summary['net_profit']} ብር"
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = "እንኳን ደህና መጡ! ወደ ገበያ ደብተር በድምጽ የሽያጭ መዝገብ ቦት። ሽያጭዎን በድምጽ ብቻ ይናገሩ።"
     await update.message.reply_text(welcome_message)
+
+
+async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    db = SessionLocal()
+    try:
+        vendor = get_or_create_vendor(db, chat_id)
+        summary = daily_summary(db, vendor.id)
+        await update.message.reply_text(format_summary(summary, "የዛሬ ማጠቃለያ (Today's Summary)"))
+    finally:
+        db.close()
+
+
+async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    db = SessionLocal()
+    try:
+        vendor = get_or_create_vendor(db, chat_id)
+        summary = weekly_summary(db, vendor.id)
+        await update.message.reply_text(format_summary(summary, "የሳምንት ማጠቃለያ (Weekly Summary)"))
+    finally:
+        db.close()
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -111,6 +144,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("today", today))
+telegram_app.add_handler(CommandHandler("week", week))
 telegram_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
 
