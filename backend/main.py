@@ -1,8 +1,11 @@
 import os
 import subprocess
 import sys
+import random
+import secrets
 import azure.cognitiveservices.speech as speechsdk
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from telegram import Update, Bot
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -26,12 +29,25 @@ AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten this to your real dashboard domain once deployed
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 ASK_NAME, ASK_SELLS = range(2)
 EDIT_FIELD, EDIT_VALUE = range(2, 4)
 
 MISTAKE_KEYWORDS = ["ስሕተት", "ስህተት"]
+
+# Simple in-memory session store: token -> vendor_id
+# (fine for a solo MVP; resets if the server restarts, vendor just requests a new code)
+SESSIONS = {}
 
 
 def convert_ogg_to_wav(ogg_path: str, wav_path: str):
@@ -131,7 +147,7 @@ async def reply_with_voice(update: Update, text: str):
         pass
 
 
-# ---------- Undo helper (shared by voice trigger and /undo command) ----------
+# ---------- Undo helper ----------
 
 async def perform_undo(update: Update, chat_id: str):
     db = SessionLocal()
@@ -255,6 +271,21 @@ async def debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     await perform_undo(update, chat_id)
+
+
+async def weblogin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    code = str(random.randint(100000, 999999))
+    db = SessionLocal()
+    try:
+        vendor = get_or_create_vendor(db, chat_id)
+        vendor.login_code = code
+        db.commit()
+    finally:
+        db.close()
+    await update.message.reply_text(
+        f"የመግቢያ ኮድዎ: {code}\n\nይህን ኮድ በድረ-ገጹ ላይ ያስገቡ። ኮዱ ለ10 ደቂቃ ብቻ ይሰራል።"
+    )
 
 
 # ---------- /edit_last conversation ----------
@@ -438,6 +469,7 @@ telegram_app.add_handler(CommandHandler("today", today))
 telegram_app.add_handler(CommandHandler("week", week))
 telegram_app.add_handler(CommandHandler("debts", debts))
 telegram_app.add_handler(CommandHandler("undo", undo_command))
+telegram_app.add_handler(CommandHandler("weblogin", weblogin_command))
 telegram_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
 
@@ -455,6 +487,72 @@ async def webhook(request: Request):
 @app.get("/")
 async def root():
     return {"status": "GebeyaBook bot is running"}
+
+
+# ---------- Dashboard API endpoints ----------
+
+@app.post("/api/verify-login")
+async def verify_login(request: Request):
+    body = await request.json()
+    code = str(body.get("code", "")).strip()
+
+    db = SessionLocal()
+    try:
+        vendor = db.query(Vendor).filter(Vendor.login_code == code).first()
+        if not vendor or not code:
+            raise HTTPException(status_code=401, detail="Invalid code")
+
+        token = secrets.token_urlsafe(24)
+        SESSIONS[token] = vendor.id
+
+        vendor.login_code = None  # single-use
+        db.commit()
+
+        return {"token": token, "vendor_name": vendor.name}
+    finally:
+        db.close()
+
+
+def get_vendor_id_from_token(authorization: str = Header(None)) -> int:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    token = authorization.replace("Bearer ", "")
+    vendor_id = SESSIONS.get(token)
+    if vendor_id is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return vendor_id
+
+
+@app.get("/api/today")
+async def api_today(authorization: str = Header(None)):
+    vendor_id = get_vendor_id_from_token(authorization)
+    db = SessionLocal()
+    try:
+        from datetime import datetime, timezone
+        start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        rows = (
+            db.query(Transaction)
+            .filter(Transaction.vendor_id == vendor_id)
+            .filter(Transaction.created_at >= start)
+            .order_by(Transaction.id.desc())
+            .all()
+        )
+        return {
+            "transactions": [
+                {
+                    "id": r.id,
+                    "type": r.type,
+                    "item": r.item,
+                    "amount": r.amount,
+                    "customer_name": r.customer_name,
+                    "note": r.note,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in rows
+            ]
+        }
+    finally:
+        db.close()
 
 
 @app.on_event("startup")

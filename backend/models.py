@@ -10,6 +10,7 @@ class Vendor(Base):
     telegram_chat_id = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, nullable=True)
     sells = Column(String, nullable=True)
+    login_code = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
