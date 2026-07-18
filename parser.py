@@ -14,19 +14,34 @@ You will receive Amharic text transcribed from a vendor's voice note, reporting 
 
 IMPORTANT CONTEXT:
 - Text comes from speech-to-text and may have errors, especially in verb endings (e.g. "ሸጠሁ", "ሸጡኩ", "ሽጥኩ" all mean "I sold"). Infer meaning from context, don't rely on exact verb spelling.
-- Numbers may appear as Amharic words or digits.
 - Common SALE verbs: ሸጥኩ / ሸጠሁ / ሽጥኩ / ተሸጠ
 - Common EXPENSE verbs: ገዛሁ / ገዛው
-- DEBT indicator: በዱቤ (on credit)
-- For DEBT transactions: the customer_name is the PERSON, never the item. A person's name in a debt sentence (e.g. "ከበደ ሶስት መቶ ብር በዱቤ ወሰደ" - Kebede took 300 birr on credit) should be extracted as customer_name, NOT as item. If no specific product/item is mentioned in a debt sentence, item should be null, not the customer name.
+- DEBT indicators: በዱቤ (on credit), or phrases meaning payment is deferred, e.g. "ነገ ይከፍላል" (will pay tomorrow), "በኋላ ይከፍላል" (will pay later), customer owes / will pay later in general — treat these the same as በዱቤ, as type "debt".
+- For DEBT transactions: the customer_name is the PERSON, never the item.
 
-CRITICAL RULE — QUANTITY vs AMOUNT:
-"amount" means the MONEY VALUE in birr — how much was paid or received. It is NOT the quantity of goods (kilos, pieces, liters). If a sentence mentions a quantity (e.g. "50 ኪሎ") but never states a birr price, the amount is MISSING — do not use the quantity number as the amount.
-Example: "ድንች 50 ኪሎ ገዛሁ" has a quantity (50 kilo) but NO price -> amount is missing -> needs_clarification.
-Example: "ድንች 50 ኪሎ በ 500 ብር ገዛሁ" -> amount is 500 (the birr value), NOT 50.
+CRITICAL RULE — COMPOUND NUMBERS:
+Amharic numbers for 101-999 are often spoken as "መቶ" (hundred) followed by a second number-word or digit meaning the remainder to ADD, not multiply. Combine them:
+- "መቶ ሰማንያ" = 100 + 80 = 180
+- "መቶ ሰላሳ" = 100 + 30 = 130
+- "ሁለት መቶ ሃያ" = 200 + 20 = 220
+- "መቶ 80" (mixed word+digit from imperfect transcription) = 100 + 80 = 180 — treat a digit right after "መቶ" the same way as a number-word: ADD it to 100, do not treat the digit as a separate/different value.
+- If you see "ሺህ" (thousand) similarly combine: "ሁለት ሺህ አምስት መቶ" = 2000 + 500 = 2500.
+Never output just the second part alone (e.g. never output 80 for "መቶ 80") and never output just 100 while ignoring the second part.
+
+CRITICAL RULE — NEVER MULTIPLY BY QUANTITY:
+"amount" is the TOTAL birr value the vendor stated, exactly as said. If a quantity (e.g. "2 ኪሎ") is also mentioned, do NOT multiply the amount by the quantity — the stated birr figure IS the total, unless the sentence explicitly gives a PER-UNIT price and separately asks for a computed total (rare — if in doubt, use the birr figure as stated, do not compute).
+Example: "ሽንኩርት 2 ኪሎ በ180 ብር ሸጠ" -> amount is 180 (the total stated), NOT 180 x 2 = 360.
+Example: "ሽንኩርት 2 ኪሎ በመቶ 80 ብር ሸጠ" -> "መቶ 80" combines to 180 -> amount is 180, NOT 80 x 2 = 160.
+
+CRITICAL RULE — QUANTITY vs AMOUNT (applies before and after every other rule):
+"amount" means the MONEY VALUE in birr, and ONLY a number that is explicitly said together with "ብር" (birr) or another currency word counts as amount. A bare number attached to a unit like ኪሎ (kilo), ፍሬ (piece), ሊትር (liter) is a QUANTITY, never an amount, no matter how large or small.
+If a sentence contains a quantity+unit (e.g. "50 ኪሎ") but NO number is paired with "ብር" anywhere in the sentence, amount is MISSING -> return needs_clarification. Do NOT fall back to using the quantity number as amount under any circumstance. Put the quantity in "note".
+Example: "ድንች 50 ኪሎ ገዛሁ" -> no "ብር" anywhere -> amount missing -> needs_clarification, even though "50" appears in the sentence.
+Example: "ድንች 50 ኪሎ በ 500 ብር ገዛሁ" -> "500 ብር" is present -> amount is 500, note is "50 ኪሎ".
 
 CRITICAL RULE — NEVER OUTPUT A NULL ITEM OR AMOUNT WITH status "ok":
-If you cannot confidently identify BOTH the item AND the birr amount, you MUST return status "needs_clarification" — never return status "ok" with item or amount set to null. There are no exceptions to this rule. (Exception: for debt transactions with no product mentioned, item may be null as long as customer_name and amount are both present.)
+The birr AMOUNT is ALWAYS required — if amount is missing or unclear for ANY transaction type (sale, expense, or debt), you MUST return status "needs_clarification" asking for the amount. There are NO exceptions to the amount requirement.
+The ITEM has ONE narrow exception: for debt transactions where no specific product is mentioned (e.g. just money owed, no goods), item may be null — but ONLY if amount and customer_name are both present. For sale and expense transactions, item is always required same as amount.
 
 Output STRICT JSON only, no explanation, no markdown. Exactly this shape:
 
@@ -37,10 +52,10 @@ Output STRICT JSON only, no explanation, no markdown. Exactly this shape:
   "amount": <number>,
   "currency": "ETB",
   "customer_name": "<string or null>",
-  "note": "<string or null, e.g. quantity like '50 ኪሎ'>"
+  "note": "<string or null, e.g. quantity like '2 ኪሎ'>"
 }
 
-OR, if item or amount is missing/unclear:
+OR:
 
 {
   "status": "needs_clarification",
