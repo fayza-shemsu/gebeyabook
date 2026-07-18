@@ -195,7 +195,19 @@ async def ask_sells_response(update: Update, context: ContextTypes.DEFAULT_TYPE)
     finally:
         db.close()
 
-    await update.message.reply_text(f"ተመዝግበዋል {name}! ከአሁን ጀምሮ ሽያጭዎን በድምጽ ብቻ ይናገሩ።")
+    await update.message.reply_text(
+        f"ተመዝግበዋል {name}! ከአሁን ጀምሮ ሽያጭዎን በድምጽ ብቻ ይናገሩ።
+
+"
+        "ምሳሌ: ሽንኩርት ሁለት ኪሎ ሁለት መቶ ብር ሸጥኩ
+
+"
+        "/today - የዛሬ ሽያጭ
+"
+        "/week - የሳምንት ሽያጭ
+"
+        "/debts - ያልተከፈለ ዱቤ"
+    )
     return ConversationHandler.END
 
 
