@@ -31,7 +31,7 @@ telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 ASK_NAME, ASK_SELLS = range(2)
 EDIT_FIELD, EDIT_VALUE = range(2, 4)
 
-MISTAKE_KEYWORDS = ["ስሕተት", "ስህተት"]  # both common spellings
+MISTAKE_KEYWORDS = ["ስሕተት", "ስህተት"]
 
 
 def convert_ogg_to_wav(ogg_path: str, wav_path: str):
@@ -97,6 +97,19 @@ def format_debts(debts: list) -> str:
     for d in debts:
         parts.append(f"{d['customer_name']} {d['total_owed']} ብር")
     return ". ".join(parts) + "።"
+
+
+def onboarding_complete_message(name: str) -> str:
+    lines = [
+        f"ተመዝግበዋል {name}! ከአሁን ጀምሮ ሽያጭዎን በድምጽ ብቻ ይናገሩ።",
+        "",
+        "ምሳሌ: ሽንኩርት ሁለት ኪሎ ሁለት መቶ ብር ሸጥኩ",
+        "",
+        "/today - የዛሬ ሽያጭ",
+        "/week - የሳምንት ሽያጭ",
+        "/debts - ያልተከፈለ ዱቤ",
+    ]
+    return "\n".join(lines)
 
 
 async def reply_with_voice(update: Update, text: str):
@@ -195,19 +208,7 @@ async def ask_sells_response(update: Update, context: ContextTypes.DEFAULT_TYPE)
     finally:
         db.close()
 
-    await update.message.reply_text(
-        f"ተመዝግበዋል {name}! ከአሁን ጀምሮ ሽያጭዎን በድምጽ ብቻ ይናገሩ።
-
-"
-        "ምሳሌ: ሽንኩርት ሁለት ኪሎ ሁለት መቶ ብር ሸጥኩ
-
-"
-        "/today - የዛሬ ሽያጭ
-"
-        "/week - የሳምንት ሽያጭ
-"
-        "/debts - ያልተከፈለ ዱቤ"
-    )
+    await update.message.reply_text(onboarding_complete_message(name))
     return ConversationHandler.END
 
 
@@ -386,7 +387,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📝 {transcribed_text}")
 
-    # Voice-triggered undo: if the vendor says a mistake keyword, undo instead of parsing as a transaction
     if any(kw in transcribed_text for kw in MISTAKE_KEYWORDS):
         await perform_undo(update, chat_id)
         return
