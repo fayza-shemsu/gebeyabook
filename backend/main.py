@@ -3,6 +3,7 @@ import subprocess
 import sys
 import random
 import secrets
+import time
 import azure.cognitiveservices.speech as speechsdk
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,6 +47,72 @@ EDIT_FIELD, EDIT_VALUE = range(2, 4)
 MISTAKE_KEYWORDS = ["ስሕተት", "ስህተት"]
 
 SESSIONS = {}
+
+RATE_LIMIT_MAX = 10
+RATE_LIMIT_WINDOW = 60
+_rate_limit_log = {}
+
+
+def is_rate_limited(chat_id: str) -> bool:
+    now = time.time()
+    timestamps = _rate_limit_log.get(chat_id, [])
+    timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+    timestamps.append(now)
+    _rate_limit_log[chat_id] = timestamps
+    return len(timestamps) > RATE_LIMIT_MAX
+
+
+VALID_TYPES = {"sale", "expense", "debt"}
+VALID_STATUSES = {"ok", "needs_clarification", "error"}
+
+
+def validate_parser_result(result: dict) -> dict:
+    if not isinstance(result, dict):
+        return {"status": "error", "raw_output": str(result)}
+
+    status = result.get("status")
+    if status not in VALID_STATUSES:
+        return {"status": "error", "raw_output": "invalid status field"}
+
+    if status == "needs_clarification":
+        if not isinstance(result.get("question"), str) or not result["question"].strip():
+            return {"status": "error", "raw_output": "missing clarification question"}
+        return result
+
+    if status == "error":
+        return result
+
+    if result.get("type") not in VALID_TYPES:
+        return {"status": "error", "raw_output": "invalid or missing type"}
+
+    amount = result.get("amount")
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool) or amount <= 0:
+        return {"status": "error", "raw_output": "invalid or missing amount"}
+
+    item = result.get("item")
+    if item is not None and not isinstance(item, str):
+        return {"status": "error", "raw_output": "invalid item field"}
+
+    if result["type"] != "debt" and not item:
+        return {"status": "error", "raw_output": "item required for sale/expense"}
+
+    customer_name = result.get("customer_name")
+    if customer_name is not None and not isinstance(customer_name, str):
+        return {"status": "error", "raw_output": "invalid customer_name field"}
+
+    note = result.get("note")
+    if note is not None and not isinstance(note, str):
+        return {"status": "error", "raw_output": "invalid note field"}
+
+    return {
+        "status": "ok",
+        "type": result["type"],
+        "item": item,
+        "amount": float(amount),
+        "currency": "ETB",
+        "customer_name": customer_name,
+        "note": note,
+    }
 
 
 def convert_ogg_to_wav(ogg_path: str, wav_path: str):
@@ -393,6 +460,10 @@ async def save_transaction(update: Update, chat_id: str, transcribed_text: str, 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
 
+    if is_rate_limited(chat_id):
+        await reply_with_voice(update, "ብዙ መልዕክቶች በፍጥነት ተልከዋል፣ እባክዎ ትንሽ ይጠብቁ።")
+        return
+
     transcribed_text = await transcribe_incoming_voice(update, context)
 
     if transcribed_text is None:
@@ -415,7 +486,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         combined_text = transcribed_text
 
-    result = parse_transaction(combined_text)
+    raw_result = parse_transaction(combined_text)
+    result = validate_parser_result(raw_result)
 
     if result.get("status") == "needs_clarification":
         context.user_data["pending_clarification"] = {"original_text": combined_text}
@@ -485,7 +557,7 @@ async def verify_login(request: Request):
             raise HTTPException(status_code=401, detail="Invalid code")
 
         token = secrets.token_urlsafe(24)
-        SESSIONS[token] = vendor.id
+        SESSIONS[token] = {"vendor_id": vendor.id, "created_at": time.time()}
 
         vendor.login_code = None
         db.commit()
@@ -495,14 +567,20 @@ async def verify_login(request: Request):
         db.close()
 
 
+SESSION_TTL_SECONDS = 14400
+
+
 def get_vendor_id_from_token(authorization: str = Header(None)) -> int:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing token")
     token = authorization.replace("Bearer ", "")
-    vendor_id = SESSIONS.get(token)
-    if vendor_id is None:
+    session = SESSIONS.get(token)
+    if session is None:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
-    return vendor_id
+    if time.time() - session["created_at"] > SESSION_TTL_SECONDS:
+        SESSIONS.pop(token, None)
+        raise HTTPException(status_code=401, detail="Session expired")
+    return session["vendor_id"]
 
 
 @app.get("/api/today")
