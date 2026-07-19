@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from database import SessionLocal
 from models import Vendor, Transaction
 from parser import parse_transaction
-from summaries import daily_summary, weekly_summary, debts_summary, get_last_transaction
+from summaries import daily_summary, weekly_summary, debts_summary, get_last_transaction, daily_breakdown_last_7_days
 from tts import synthesize_speech
 
 load_dotenv()
@@ -32,7 +32,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this to your real dashboard domain once deployed
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -45,8 +45,6 @@ EDIT_FIELD, EDIT_VALUE = range(2, 4)
 
 MISTAKE_KEYWORDS = ["ስሕተት", "ስህተት"]
 
-# Simple in-memory session store: token -> vendor_id
-# (fine for a solo MVP; resets if the server restarts, vendor just requests a new code)
 SESSIONS = {}
 
 
@@ -147,8 +145,6 @@ async def reply_with_voice(update: Update, text: str):
         pass
 
 
-# ---------- Undo helper ----------
-
 async def perform_undo(update: Update, chat_id: str):
     db = SessionLocal()
     try:
@@ -165,8 +161,6 @@ async def perform_undo(update: Update, chat_id: str):
     finally:
         db.close()
 
-
-# ---------- Onboarding conversation ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -233,8 +227,6 @@ async def cancel_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------- Summaries ----------
-
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     db = SessionLocal()
@@ -287,8 +279,6 @@ async def weblogin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"የመግቢያ ኮድዎ: {code}\n\nይህን ኮድ በድረ-ገጹ ላይ ያስገቡ። ኮዱ ለ10 ደቂቃ ብቻ ይሰራል።"
     )
 
-
-# ---------- /edit_last conversation ----------
 
 async def edit_last_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -377,8 +367,6 @@ async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------- Save a completed parsed transaction ----------
-
 async def save_transaction(update: Update, chat_id: str, transcribed_text: str, result: dict):
     db = SessionLocal()
     try:
@@ -401,8 +389,6 @@ async def save_transaction(update: Update, chat_id: str, transcribed_text: str, 
     finally:
         db.close()
 
-
-# ---------- Main voice transaction handler ----------
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -442,8 +428,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await save_transaction(update, chat_id, combined_text, result)
 
-
-# ---------- Handlers setup ----------
 
 onboarding_conv = ConversationHandler(
     entry_points=[CommandHandler("start", start)],
@@ -489,8 +473,6 @@ async def root():
     return {"status": "GebeyaBook bot is running"}
 
 
-# ---------- Dashboard API endpoints ----------
-
 @app.post("/api/verify-login")
 async def verify_login(request: Request):
     body = await request.json()
@@ -505,7 +487,7 @@ async def verify_login(request: Request):
         token = secrets.token_urlsafe(24)
         SESSIONS[token] = vendor.id
 
-        vendor.login_code = None  # single-use
+        vendor.login_code = None
         db.commit()
 
         return {"token": token, "vendor_name": vendor.name}
@@ -551,6 +533,17 @@ async def api_today(authorization: str = Header(None)):
                 for r in rows
             ]
         }
+    finally:
+        db.close()
+
+
+@app.get("/api/week-breakdown")
+async def api_week_breakdown(authorization: str = Header(None)):
+    vendor_id = get_vendor_id_from_token(authorization)
+    db = SessionLocal()
+    try:
+        breakdown = daily_breakdown_last_7_days(db, vendor_id)
+        return {"days": breakdown}
     finally:
         db.close()
 

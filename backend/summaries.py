@@ -68,3 +68,22 @@ def get_last_transaction(db, vendor_id: int):
         .order_by(Tx.id.desc())
         .first()
     )
+
+
+def daily_breakdown_last_7_days(db, vendor_id: int) -> list:
+    """Return a list of {date, total_sales, total_expenses} for each of the last 7 days, oldest first."""
+    from datetime import datetime, timedelta, timezone
+    results = []
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    for i in range(6, -1, -1):
+        day = today - timedelta(days=i)
+        summary = daily_summary(db, vendor_id, day)
+        results.append({
+            "date": day.strftime("%Y-%m-%d"),
+            "total_sales": summary["total_sales"],
+            "total_expenses": summary["total_expenses"],
+        })
+    return results
+
+
+    return results
